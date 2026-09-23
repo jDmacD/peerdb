@@ -63,7 +63,7 @@ graph TB
 
     subgraph STATE["STATE LAYER"]
         catalog["Catalog (PostgreSQL)<br/><i>peers, flows, table_schema_mapping,<br/>cdc_batch_table, mirror_jobs,<br/>schema_delta_audit, flow_errors</i>"]
-        minio["MinIO<br/><i>S3-compatible AVRO staging</i>"]
+        garage["Garage<br/><i>S3-compatible AVRO staging</i>"]
     end
 
     psql --> nexus
@@ -80,7 +80,7 @@ graph TB
     SOURCES --> STATE
     DESTINATIONS --> STATE
     flow_worker --> STATE
-    snap_worker --> minio
+    snap_worker --> garage
 ```
 
 ---
@@ -162,9 +162,14 @@ Temporal provides durable workflow execution with automatic retries, checkpointi
 
 Stores all PeerDB metadata: peer configurations (encrypted), flow definitions (serialized protobuf), CDC batch progress, schema mappings, and error logs. Uses `pgxpool` with max_conns=3 and 90s idle timeout.
 
-### 3.7 MinIO
+### 3.7 Garage
 
 S3-compatible object storage used for staging AVRO files during snapshot operations. In production, replaced by actual S3/GCS.
+
+Local only: a single-node, single-replica cluster with no redundancy. It is
+configured from `volumes/garage/garage.toml`, and `volumes/garage/init.sh`
+bootstraps the cluster layout, access key, and staging bucket through Garage's
+admin API on first start.
 
 ---
 
@@ -518,7 +523,7 @@ flowchart TD
 1. `pg_export_snapshot()` — freeze a consistent view of all tables
 2. Partition each table into CTID ranges for parallel reads
 3. Pull partitions in parallel using the exported snapshot
-4. Stream AVRO files to staging (MinIO/S3/GCS)
+4. Stream AVRO files to staging (Garage/S3/GCS)
 5. Consolidate staged data on the destination
 
 The replication slot created during setup holds WAL from the snapshot point, ensuring no data is lost between snapshot completion and CDC start.
