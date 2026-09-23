@@ -14,16 +14,17 @@ x-ports:
   - &flow-worker-debug-port   ${DOCKER_GO_DEBUG_PORT_FLOW_WORKER:-40001}:40000
   - &flow-snapshot-worker-debug-port ${DOCKER_GO_DEBUG_PORT_FLOW_SNAPSHOT_WORKER:-40002}:40000
   - &flow-api-debug-port      ${DOCKER_GO_DEBUG_PORT_FLOW_API:-40003}:40000
-  - &minio-port               ${MINIO_PORT:-9001}:9000
-  - &minio-console-port       ${MINIO_CONSOLE_PORT:-9002}:36987
+  - &garage-port              ${GARAGE_PORT:-9001}:3900
+  - &garage-admin-port        ${GARAGE_ADMIN_PORT:-9002}:3903
 
-x-minio-config: &minio-config
-  PEERDB_CLICKHOUSE_AWS_CREDENTIALS_AWS_ACCESS_KEY_ID: _peerdb_minioadmin
-  MINIO_ROOT_USER: _peerdb_minioadmin
-  PEERDB_CLICKHOUSE_AWS_CREDENTIALS_AWS_SECRET_ACCESS_KEY: _peerdb_minioadmin
-  MINIO_ROOT_PASSWORD: _peerdb_minioadmin
+# Garage keys must be "GK" + 12 hex bytes, and secrets 32 hex bytes, so these
+# are the fixed local-only stand-ins for the old _peerdb_minioadmin pair.
+x-s3-staging-config: &s3-staging-config
+  # Quoted: an all-digit hex secret is otherwise parsed as a YAML float.
+  PEERDB_CLICKHOUSE_AWS_CREDENTIALS_AWS_ACCESS_KEY_ID: "GK706565726462706565726462"
+  PEERDB_CLICKHOUSE_AWS_CREDENTIALS_AWS_SECRET_ACCESS_KEY: "07b69de97584583d57adc33683cc004ad1315bce60e2b29e9bd68e7e8fde6846"
   PEERDB_CLICKHOUSE_AWS_CREDENTIALS_AWS_REGION: us-east-1
-  PEERDB_CLICKHOUSE_AWS_CREDENTIALS_AWS_ENDPOINT_URL_S3: http://host.docker.internal:${MINIO_PORT:-9001}
+  PEERDB_CLICKHOUSE_AWS_CREDENTIALS_AWS_ENDPOINT_URL_S3: http://host.docker.internal:${GARAGE_PORT:-9001}
   PEERDB_CLICKHOUSE_AWS_S3_BUCKET_NAME: peerdb
 
 x-catalog-config: &catalog-config
@@ -180,7 +181,7 @@ services:
       - *peerdb-switchboard-port
       - *flow-api-debug-port
     environment:
-      <<: [*catalog-config, *flow-worker-env, *minio-config]
+      <<: [*catalog-config, *flow-worker-env, *s3-staging-config]
       PEERDB_ALLOWED_TARGETS:
       PEERDB_CLICKHOUSE_ALLOWED_DOMAINS:
       PEERDB_API_REQUEST_LOGGING_ENABLED: true
@@ -192,6 +193,8 @@ services:
         condition: service_completed_successfully
       temporal-admin-tools:
         condition: service_healthy
+      garage-init:
+        condition: service_completed_successfully
 
   flow-snapshot-worker:
     container_name: flow-snapshot-worker
@@ -203,7 +206,7 @@ services:
     ports:
       - *flow-snapshot-worker-debug-port
     environment:
-      <<: [*catalog-config, *flow-worker-env, *minio-config]
+      <<: [*catalog-config, *flow-worker-env, *s3-staging-config]
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -211,6 +214,8 @@ services:
         condition: service_completed_successfully
       temporal-admin-tools:
         condition: service_healthy
+      garage-init:
+        condition: service_completed_successfully
 
   flow-worker:
     container_name: flow-worker
@@ -227,7 +232,7 @@ services:
     # cap_add:
     #   - SYS_PTRACE         # Required for Delve
     environment:
-      <<: [*catalog-config, *flow-worker-env, *minio-config]
+      <<: [*catalog-config, *flow-worker-env, *s3-staging-config]
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -235,6 +240,8 @@ services:
         condition: service_completed_successfully
       temporal-admin-tools:
         condition: service_healthy
+      garage-init:
+        condition: service_completed_successfully
 
   peerdb:
     container_name: peerdb-server
@@ -292,27 +299,33 @@ services:
     depends_on:
       - flow-api
 
-  minio:
-    image: quay.io/minio/minio:latest@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+  garage:
+    image: dxflrs/garage:v2.1.0@sha256:4c9b34c113e61358466e83fd6e7d66e6d18657ede14b776eb78a93ee8da7cf6a
+    command: ["/garage", "server"]
     volumes:
-      - minio-data:/data
+      - garage-data:/var/lib/garage
+      - ./volumes/garage/garage.toml:/etc/garage.toml:ro
     ports:
-      - *minio-port
-      - *minio-console-port
+      - *garage-port
+      - *garage-admin-port
+
+  # Garage is a scratch image with no shell, so layout/key/bucket setup runs
+  # from here. Services that stage to S3 wait on this, not on garage itself.
+  garage-init:
+    image: curlimages/curl:8.11.1@sha256:c1fe1679c34d9784c1b0d1e5f62ac0a79fca01fb6377cdd33e90473c6f9f9a69
+    restart: on-failure
+    volumes:
+      - ./volumes/garage/init.sh:/init.sh:ro
     environment:
-      <<: *minio-config
-    entrypoint: >
-      /bin/sh -c "
-      minio server /data --console-address=:36987 &
-      sleep 2;
-      mc alias set myminiopeerdb http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD;
-      mc mb myminiopeerdb/$$PEERDB_CLICKHOUSE_AWS_S3_BUCKET_NAME;
-      wait
-      "
+      <<: *s3-staging-config
+      GARAGE_ADMIN_TOKEN: peerdb-garage-admin
+    entrypoint: ["/bin/sh", "/init.sh"]
+    depends_on:
+      - garage
 
 volumes:
   pgdata:
-  minio-data:
+  garage-data:
 
 networks:
   default:
